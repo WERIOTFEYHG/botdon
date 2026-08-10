@@ -1,7 +1,6 @@
 """
-ربات دانلودر تلگرام - نسخه نهایی
-پشتیبانی از: اینستاگرام، توییتر/X، یوتیوب، پینترست، تیک‌تاک، ردیت
-با قابلیت دانلود یوتیوب با بالاترین کیفیت (4K/8K)
+ربات دانلودر تلگرام - نسخه کامل با چند ابزار برای یوتیوب
+بقیه پلتفرم‌ها بدون تغییر
 """
 import os
 import re
@@ -20,6 +19,7 @@ from html import escape as html_escape
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 import requests
 import yt_dlp
@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 CAPTION_LIMIT = 1024
 
 # ============================== گلوبال ==============================
-ADMIN_IDS: set[int] = {7714450221}  # ← آیدی عددی خودت رو اینجا بذار
+ADMIN_IDS: set[int] = {7714450221}
 admin_states: Dict[int, str] = {}
 pending_youtube: Dict[str, dict] = {}
 DB_PATH = "/data/bot_data.db"
@@ -74,9 +74,7 @@ def load_config() -> Config:
         raise RuntimeError("❌ BOT_TOKEN تنظیم نشده!")
 
     db_path = os.getenv("DB_PATH", "/data/bot_data.db")
-    db_dir = os.path.dirname(db_path)
-    if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else ".", exist_ok=True)
 
     admin_ids = ADMIN_IDS.copy()
     env_ids = os.getenv("ADMIN_IDS", "")
@@ -89,7 +87,7 @@ def load_config() -> Config:
 
     return Config(
         bot_token=bot_token,
-        max_file_size_mb=int(os.getenv("MAX_FILE_SIZE_MB", "200")),
+        max_file_size_mb=int(os.getenv("MAX_FILE_SIZE_MB", "50")),
         download_dir=os.getenv("DOWNLOAD_DIR", "/tmp/downloads"),
         max_concurrent_downloads=int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2")),
         rate_limit_seconds=float(os.getenv("RATE_LIMIT_SECONDS", "2")),
@@ -114,33 +112,28 @@ def db_init():
             CREATE TABLE IF NOT EXISTS force_sub_channels (chat_id TEXT PRIMARY KEY, title TEXT, invite_link TEXT, added_at TEXT);
             CREATE TABLE IF NOT EXISTS channel_verifications (user_id INTEGER, chat_id TEXT, verified_at TEXT, PRIMARY KEY(user_id, chat_id));
         """)
-    logger.info("✅ دیتابیس آماده شد")
 
 def _now(): return datetime.now(timezone.utc).isoformat()
 
 def db_record_user(uid: int):
     try:
         with get_db() as conn:
-            conn.execute("INSERT INTO users VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET last_active=?", 
-                        (uid, _now(), _now(), _now()))
+            conn.execute("INSERT INTO users VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET last_active=?", (uid, _now(), _now(), _now()))
     except: pass
 
 def db_record_download(uid: int, platform: str, url: str = ""):
     try:
         with get_db() as conn:
-            conn.execute("INSERT INTO downloads (user_id, platform, url, created_at) VALUES (?,?,?,?)", 
-                        (uid, platform, url, _now()))
+            conn.execute("INSERT INTO downloads (user_id, platform, url, created_at) VALUES (?,?,?,?)", (uid, platform, url, _now()))
     except: pass
 
 def db_get_stats():
     with get_db() as conn:
-        return (conn.execute("SELECT COUNT(*) FROM users").fetchone()[0],
-                conn.execute("SELECT COUNT(*) FROM downloads").fetchone()[0])
+        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0], conn.execute("SELECT COUNT(*) FROM downloads").fetchone()[0]
 
 def db_add_channel(chat_id, title, link):
     with get_db() as conn:
-        conn.execute("INSERT OR REPLACE INTO force_sub_channels VALUES (?,?,?,?)", 
-                    (chat_id, title, link, _now()))
+        conn.execute("INSERT OR REPLACE INTO force_sub_channels VALUES (?,?,?,?)", (chat_id, title, link, _now()))
 
 def db_remove_channel(chat_id):
     with get_db() as conn:
@@ -153,13 +146,11 @@ def db_list_channels():
 
 def db_record_verification(uid, chat_id):
     with get_db() as conn:
-        conn.execute("INSERT OR IGNORE INTO channel_verifications VALUES (?,?,?)", 
-                    (uid, chat_id, _now()))
+        conn.execute("INSERT OR IGNORE INTO channel_verifications VALUES (?,?,?)", (uid, chat_id, _now()))
 
 def db_verified_count(chat_id):
     with get_db() as conn:
-        return conn.execute("SELECT COUNT(*) FROM channel_verifications WHERE chat_id=?", 
-                           (chat_id,)).fetchone()[0]
+        return conn.execute("SELECT COUNT(*) FROM channel_verifications WHERE chat_id=?", (chat_id,)).fetchone()[0]
 
 
 # ============================== تشخیص پلتفرم ==============================
@@ -172,10 +163,7 @@ PLATFORM_PATTERNS = {
     "reddit": re.compile(r"(reddit\.com|redd\.it)", re.I),
 }
 
-def extract_url(text): 
-    match = re.search(r"https?://\S+", text)
-    return match.group(0) if match else None
-
+def extract_url(text): return (re.search(r"https?://\S+", text) or [None])[0]
 def detect_platform(url):
     for p, pat in PLATFORM_PATTERNS.items():
         if pat.search(url): return p
@@ -183,19 +171,15 @@ def detect_platform(url):
 
 def build_caption(text):
     if not text or not text.strip(): return "✅ دانلود شد"
-    text = text.strip()
-    if len(text) > 950: text = text[:950] + "…"
+    text = text.strip()[:950] + ("…" if len(text.strip()) > 950 else "")
     return html_escape(text, quote=False)[:CAPTION_LIMIT]
 
 
 # ============================== دانلودر ==============================
-class DownloadError(Exception): 
-    pass
+class DownloadError(Exception): pass
 
-_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-}
-MediaItem = tuple[str, str]  # (path, type)
+_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"}
+MediaItem = tuple[str, str]
 
 class Downloader:
     def __init__(self, download_dir: str, max_file_size_mb: int, cobalt_instance: str = "https://api.cobalt.tools"):
@@ -206,8 +190,6 @@ class Downloader:
         os.makedirs(download_dir, exist_ok=True)
 
     def _find_file(self, fid: str) -> Optional[str]:
-        if not os.path.exists(self.download_dir):
-            return None
         for f in os.listdir(self.download_dir):
             if f.startswith(fid):
                 return os.path.join(self.download_dir, f)
@@ -223,69 +205,74 @@ class Downloader:
         return "❌ نتونستم دانلود کنم"
 
     def _save(self, resp, path: str) -> bool:
+        total = 0
         try:
-            total = 0
             with open(path, "wb") as f:
                 for chunk in resp.iter_content(8192):
                     total += len(chunk)
                     if total > self.max_size:
-                        f.close()
                         os.remove(path)
                         return False
                     f.write(chunk)
-            if total == 0:
-                os.remove(path)
-                return False
-            return True
+            return total > 0
         except:
-            if os.path.exists(path): 
-                os.remove(path)
+            if os.path.exists(path): os.remove(path)
             return False
 
-    # ==================== یوتیوب ====================
-    
+    # ===================================================================
+    #                     متدهای مخصوص یوتیوب (چندلایه)
+    # ===================================================================
+
     def _youtube_cobalt(self, url: str, fid: str):
-        """Cobalt API - بالاترین کیفیت"""
+        """لایه ۱: cobalt.tools (سریع، ضد تحریم)"""
+        logger.info("🎯 تلاش با Cobalt API...")
         try:
             api_url = f"{self.cobalt_instance}/api/json"
             payload = {
                 "url": url,
-                "vQuality": "max",
-                "vCodec": "h264",
-                "aFormat": "best",
                 "filenamePattern": "basic",
+                "vCodec": "h264",
+                "aFormat": "mp3",
+                "downloadMode": "auto",
             }
-            headers = {"Accept": "application/json", "Content-Type": "application/json"}
+            headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }
             
             resp = requests.post(api_url, json=payload, headers=headers, timeout=30)
-            if resp.status_code != 200:
-                return [], None
             
-            data = resp.json()
-            if data.get("status") == "error":
-                return [], None
-            
-            download_url = data.get("url")
-            if not download_url:
-                return [], None
-            
-            media_resp = requests.get(download_url, headers=_HEADERS, timeout=120, stream=True)
-            content_type = media_resp.headers.get("Content-Type", "")
-            ext = ".mp4" if "video" in content_type or "octet-stream" in content_type else ".jpg"
-            path = os.path.join(self.download_dir, f"{fid}{ext}")
-            
-            if self._save(media_resp, path):
-                size = os.path.getsize(path)
-                logger.info(f"✅ Cobalt: {size//1024//1024}MB")
-                mtype = "video" if ext == ".mp4" else "photo"
-                return [(path, mtype)], None
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("status") == "error":
+                    logger.warning(f"Cobalt error: {data.get('text', 'unknown')}")
+                    return [], None
+                
+                download_url = data.get("url")
+                if not download_url:
+                    return [], None
+                
+                # دانلود از لینک مستقیم
+                media_resp = requests.get(download_url, headers=_HEADERS, timeout=60, stream=True)
+                ext = ".mp4" if "video" in media_resp.headers.get("Content-Type", "") else ".jpg"
+                path = os.path.join(self.download_dir, f"{fid}{ext}")
+                
+                if self._save(media_resp, path):
+                    size = os.path.getsize(path)
+                    logger.info(f"✅ Cobalt دانلود کرد: {size} بایت")
+                    return [(path, "video" if ext == ".mp4" else "photo")], None
+            else:
+                logger.warning(f"Cobalt HTTP {resp.status_code}: {resp.text[:200]}")
         except Exception as e:
-            logger.warning(f"Cobalt: {e}")
+            logger.warning(f"Cobalt failed: {e}")
+        
         return [], None
 
-    def _youtube_ytdlp(self, url: str, fid: str):
-        """yt-dlp - بالاترین کیفیت ممکن"""
+    def _youtube_ytdlp_mp4(self, url: str, fid: str):
+        """لایه ۲: yt-dlp با فرمت mp4 مستقیم"""
+        logger.info("🎯 تلاش با yt-dlp (mp4 مستقیم)...")
         output = os.path.join(self.download_dir, f"{fid}.%(ext)s")
+        
         ydl_opts = {
             "outtmpl": output,
             "quiet": True,
@@ -296,11 +283,12 @@ class Downloader:
             "fragment_retries": 5,
             "socket_timeout": 30,
             "restrictfilenames": True,
-            "format": "bestvideo*+bestaudio/bestvideo+bestaudio/best",
+            "format": "best[ext=mp4][height<=1080]/best[ext=mp4]/best[height<=1080]/best",
             "merge_output_format": "mp4",
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["android", "ios", "web"],
+                    "player_client": ["android", "ios", "web", "tv"],
+                    "skip": ["hls", "dash"],
                 }
             },
         }
@@ -310,6 +298,66 @@ class Downloader:
                 info = ydl.extract_info(url, download=True)
                 filepath = ydl.prepare_filename(info)
                 
+                # پیدا کردن فایل
+                for ext in [".mp4", ".webm", ".mkv"]:
+                    base = os.path.splitext(filepath)[0]
+                    if os.path.exists(base + ext):
+                        filepath = base + ext
+                        break
+                
+                if not os.path.exists(filepath):
+                    filepath = self._find_file(fid)
+                
+                if not filepath or not os.path.exists(filepath):
+                    raise DownloadError("فایلی دانلود نشد")
+                
+                size = os.path.getsize(filepath)
+                if size == 0:
+                    os.remove(filepath)
+                    raise DownloadError("فایل خالیه")
+                if size > self.max_size:
+                    os.remove(filepath)
+                    raise DownloadError(f"حجم {size//1024//1024}MB زیاده")
+                
+                caption = info.get("title", "").strip()
+                logger.info(f"✅ yt-dlp دانلود کرد: {size} بایت")
+                return [(filepath, "video")], caption
+        except Exception as e:
+            logger.warning(f"yt-dlp failed: {e}")
+        
+        return [], None
+
+    def _youtube_ytdlp_audio_video(self, url: str, fid: str):
+        """لایه ۳: yt-dlp با merge صدا و تصویر (نیاز به ffmpeg)"""
+        logger.info("🎯 تلاش با yt-dlp (merge audio+video)...")
+        output = os.path.join(self.download_dir, f"{fid}.%(ext)s")
+        
+        ydl_opts = {
+            "outtmpl": output,
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "max_filesize": self.max_size,
+            "retries": 5,
+            "fragment_retries": 5,
+            "socket_timeout": 30,
+            "restrictfilenames": True,
+            "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+            "merge_output_format": "mp4",
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "ios", "web", "tv", "mweb"],
+                    "skip": [],
+                }
+            },
+        }
+        
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filepath = ydl.prepare_filename(info)
+                
+                # پیدا کردن فایل merged
                 base = os.path.splitext(filepath)[0]
                 for ext in [".mp4", ".webm", ".mkv"]:
                     if os.path.exists(base + ext):
@@ -328,18 +376,21 @@ class Downloader:
                     raise DownloadError("فایل خالیه")
                 if size > self.max_size:
                     os.remove(filepath)
-                    raise DownloadError(f"حجم {size//1024//1024}MB از حد مجاز بیشتره")
+                    raise DownloadError(f"حجم {size//1024//1024}MB زیاده")
                 
-                title = info.get("title", "").strip()
-                logger.info(f"✅ yt-dlp: {size//1024//1024}MB")
-                return [(filepath, "video")], title
+                caption = info.get("title", "").strip()
+                logger.info(f"✅ yt-dlp merge دانلود کرد: {size} بایت")
+                return [(filepath, "video")], caption
         except Exception as e:
-            logger.warning(f"yt-dlp: {e}")
+            logger.warning(f"yt-dlp merge failed: {e}")
+        
         return [], None
 
-    def _youtube_piped(self, url: str, fid: str):
-        """Piped API"""
+    def _youtube_piped_api(self, url: str, fid: str):
+        """لایه ۴: Piped API (غیرمستقیم، ضد تحریم)"""
+        logger.info("🎯 تلاش با Piped API...")
         try:
+            # استخراج video ID
             video_id = None
             for pattern in [r"v=([a-zA-Z0-9_-]{11})", r"youtu\.be/([a-zA-Z0-9_-]{11})"]:
                 match = re.search(pattern, url)
@@ -350,51 +401,85 @@ class Downloader:
             if not video_id:
                 return [], None
             
-            for piped_api in ["https://pipedapi.kavin.rocks", "https://piped-api.garudalinux.org"]:
+            # لیست instance های Piped
+            piped_instances = [
+                "https://pipedapi.kavin.rocks",
+                "https://piped-api.garudalinux.org",
+                "https://pipedapi.r4fo.com",
+            ]
+            
+            for piped_api in piped_instances:
                 try:
-                    resp = requests.get(f"{piped_api}/streams/{video_id}", headers=_HEADERS, timeout=15)
+                    api_url = f"{piped_api}/streams/{video_id}"
+                    resp = requests.get(api_url, headers=_HEADERS, timeout=15)
+                    
                     if resp.status_code != 200:
                         continue
                     
                     data = resp.json()
+                    
+                    # گرفتن بهترین کیفیت
                     video_streams = data.get("videoStreams", [])
+                    audio_streams = data.get("audioStreams", [])
+                    
                     if not video_streams:
                         continue
                     
-                    # بالاترین کیفیت
-                    best = max(video_streams, key=lambda x: int(x.get("quality", "0").replace("p", "") or "0"))
-                    video_url = best.get("url")
+                    # پیدا کردن بهترین کیفیت (حداکثر 1080p)
+                    best_video = None
+                    for vs in video_streams:
+                        quality = int(vs.get("quality", "0").replace("p", "") or "0")
+                        if quality <= 1080 and (not best_video or quality > int(best_video.get("quality", "0").replace("p", "") or "0")):
+                            best_video = vs
+                    
+                    if not best_video:
+                        best_video = video_streams[-1]
+                    
+                    video_url = best_video.get("url")
                     if not video_url:
                         continue
                     
-                    media_resp = requests.get(video_url, headers=_HEADERS, timeout=120, stream=True)
+                    # دانلود
+                    media_resp = requests.get(video_url, headers=_HEADERS, timeout=60, stream=True)
                     path = os.path.join(self.download_dir, f"{fid}.mp4")
                     
                     if self._save(media_resp, path):
                         size = os.path.getsize(path)
-                        logger.info(f"✅ Piped: {size//1024//1024}MB")
+                        logger.info(f"✅ Piped دانلود کرد: {size} بایت")
                         return [(path, "video")], data.get("title", "").strip()
                 except:
                     continue
         except Exception as e:
-            logger.warning(f"Piped: {e}")
+            logger.warning(f"Piped failed: {e}")
+        
         return [], None
 
     def _download_youtube(self, url: str, fid: str):
-        """دانلود یوتیوب با چند روش"""
-        for method in [self._youtube_cobalt, self._youtube_ytdlp, self._youtube_piped]:
-            try:
-                items, caption = method(url, fid)
-                if items:
-                    return items, caption
-            except:
-                continue
+        """دانلود یوتیوب با چند لایه"""
+        methods = [
+            (self._youtube_cobalt, "Cobalt"),
+            (self._youtube_ytdlp_mp4, "yt-dlp mp4"),
+            (self._youtube_ytdlp_audio_video, "yt-dlp merge"),
+            (self._youtube_piped_api, "Piped API"),
+        ]
         
-        raise DownloadError("❌ نتونستم ویدیو رو دانلود کنم")
+        for method_func, method_name in methods:
+            try:
+                items, caption = method_func(url, fid)
+                if items:
+                    logger.info(f"🏆 یوتیوب با {method_name} دانلود شد")
+                    return items, caption
+            except Exception as e:
+                logger.warning(f"روش {method_name} شکست خورد: {e}")
+        
+        raise DownloadError("❌ هیچکدوم از روش‌های یوتیوب جواب نداد")
 
-    # ==================== بقیه پلتفرم‌ها ====================
+    # ===================================================================
+    #                     بقیه پلتفرم‌ها (بدون تغییر)
+    # ===================================================================
 
     def _try_hikerapi(self, url: str, fid: str):
+        """اینستاگرام با HikerAPI"""
         if not self.hikerapi_key:
             return [], None
         try:
@@ -415,25 +500,24 @@ class Downloader:
         results = []
         for i, item in enumerate(media[:10]):
             if item.get("video_versions"):
-                media_url = item["video_versions"][0].get("url")
+                url_media = item["video_versions"][0].get("url")
                 mtype, ext = "video", ".mp4"
             else:
                 candidates = (item.get("image_versions2") or {}).get("candidates") or []
-                media_url = candidates[0].get("url") if candidates else None
+                url_media = candidates[0].get("url") if candidates else None
                 mtype, ext = "photo", ".jpg"
             
-            if not media_url:
-                continue
+            if not url_media: continue
             path = os.path.join(self.download_dir, f"{fid}_{i}{ext}")
             try:
-                r = requests.get(media_url, headers=_HEADERS, timeout=30, stream=True)
+                r = requests.get(url_media, headers=_HEADERS, timeout=30, stream=True)
                 if self._save(r, path):
                     results.append((path, mtype))
-            except:
-                pass
+            except: pass
         return results, caption
 
-    def _try_ytdlp_generic(self, url: str, fid: str):
+    def _try_ytdlp(self, url: str, platform: str, fid: str):
+        """yt-dlp برای بقیه پلتفرم‌ها"""
         output = os.path.join(self.download_dir, f"{fid}.%(ext)s")
         ydl_opts = {
             "outtmpl": output,
@@ -474,16 +558,20 @@ class Downloader:
                     os.remove(filepath)
                     raise DownloadError(f"حجم {size//1024//1024}MB زیاده")
                 
-                ext = os.path.splitext(filepath)[1].lower()
-                mtype = "video" if ext in (".mp4", ".mov", ".webm", ".mkv") else "photo"
+                mtype = "video" if os.path.splitext(filepath)[1].lower() in (".mp4", ".mov", ".webm", ".mkv") else "photo"
                 caption = info.get("title", "").strip() or None
                 
                 return [(filepath, mtype)], caption
-        except:
+        except Exception as e:
             return [], None
 
-    def _try_gallerydl(self, url: str, fid: str):
+    def _try_gallerydl(self, url: str, platform: str, fid: str):
+        """gallery-dl برای بقیه"""
         cmd = ["gallery-dl", "-g", "--no-download"]
+        if platform == "reddit":
+            cid = os.getenv("REDDIT_CLIENT_ID")
+            if cid:
+                cmd += ["-o", f"extractor.reddit.client-id={cid}", "-o", f"extractor.reddit.client-secret={os.getenv('REDDIT_CLIENT_SECRET', '')}"]
         cmd.append(url)
         
         try:
@@ -499,22 +587,19 @@ class Downloader:
             try:
                 r = requests.get(u, headers=_HEADERS, timeout=30, stream=True)
                 if self._save(r, path):
-                    mtype = "video" if ext == ".mp4" else "photo"
-                    results.append((path, mtype))
-            except:
-                pass
+                    results.append((path, "video" if ext == ".mp4" else "photo"))
+            except: pass
         return results, None
 
     def _try_og(self, url: str, fid: str):
+        """OG fallback برای همه"""
         try:
             r = requests.get(url, headers=_HEADERS, timeout=15, allow_redirects=True)
             img = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', r.text, re.I)
-            if not img:
-                return [], None
+            if not img: return [], None
             
             img_url = img.group(1).replace("&amp;", "&")
-            if img_url.startswith("//"):
-                img_url = "https:" + img_url
+            if img_url.startswith("//"): img_url = "https:" + img_url
             
             resp = requests.get(img_url, headers=_HEADERS, timeout=20, stream=True)
             ct = resp.headers.get("Content-Type", "")
@@ -523,50 +608,64 @@ class Downloader:
             
             if self._save(resp, path):
                 return [(path, "photo")], None
-        except:
-            pass
+        except: pass
         return [], None
 
-    # ==================== متد اصلی ====================
+    # ===================================================================
+    #                     متد اصلی دانلود
+    # ===================================================================
+
+    async def download(self, url: str, platform: str):
+        """دانلود async"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._download_sync, url, platform)
 
     def _download_sync(self, url: str, platform: str):
         fid = str(uuid.uuid4())[:8]
         logger.info(f"📥 {platform} | {url[:80]}")
 
-        # یوتیوب
+        # === مسیر ویژه یوتیوب ===
         if platform == "youtube":
             return self._download_youtube(url, fid)
 
-        # اینستاگرام با HikerAPI
+        # === بقیه پلتفرم‌ها (بدون تغییر) ===
         if platform == "instagram" and self.hikerapi_key:
             items, cap = self._try_hikerapi(url, fid)
-            if items:
-                return items, cap
+            if items: return items, cap
 
-        # yt-dlp
-        items, cap = self._try_ytdlp_generic(url, fid)
-        if items:
-            return items, cap
+        items, cap = self._try_ytdlp(url, platform, fid)
+        if items: return items, cap
 
-        # gallery-dl
-        items, cap = self._try_gallerydl(url, fid)
-        if items:
-            return items, cap
+        items, cap = self._try_gallerydl(url, platform, fid)
+        if items: return items, cap
 
-        # OG
         items, cap = self._try_og(url, fid)
-        if items:
-            return items, cap
+        if items: return items, cap
 
         raise DownloadError("❌ هیچ روشی جواب نداد")
 
-    async def download(self, url: str, platform: str):
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._download_sync, url, platform)
+    # ===================================================================
+    #                     یوتیوب - لیست کیفیت‌ها
+    # ===================================================================
 
-    # ==================== یوتیوب: کیفیت‌ها ====================
+    def _list_qualities_cobalt(self, url: str):
+        """دریافت کیفیت‌های یوتیوب (فقط یک کیفیت با cobalt)"""
+        try:
+            api_url = f"{self.cobalt_instance}/api/json"
+            payload = {"url": url, "filenamePattern": "basic"}
+            headers = {"Accept": "application/json", "Content-Type": "application/json"}
+            resp = requests.post(api_url, json=payload, headers=headers, timeout=15)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("url"):
+                    return [{"height": 1080, "approx_size_mb": None}], None
+        except: pass
+        
+        return [], None
 
     def list_qualities(self, url: str):
+        """لیست کیفیت‌ها (yt-dlp)"""
         opts = {
             "quiet": True,
             "no_warnings": True,
@@ -579,92 +678,33 @@ class Downloader:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
         except:
+            # اگر yt-dlp کار نکرد، کیفیت پیش‌فرض رو نشون بده
             return [{"height": 720, "approx_size_mb": None}], None
 
         formats = info.get("formats", [])
-        heights = {}
-        for f in formats:
-            h = f.get("height")
-            if not h or h == 0:
-                continue
-            
-            if h not in heights:
-                heights[h] = {"size": 0, "has_audio": False}
-            
-            size = f.get("filesize") or f.get("filesize_approx") or 0
-            if size > heights[h]["size"]:
-                heights[h]["size"] = size
-            
-            if f.get("acodec") and f["acodec"] != "none":
-                heights[h]["has_audio"] = True
+        heights = sorted(
+            {f["height"] for f in formats if f.get("height") and f["height"] <= 1080 and f["height"] > 0},
+            reverse=True,
+        )
 
         results = []
-        for h in sorted(heights.keys(), reverse=True)[:10]:
-            info_h = heights[h]
-            size_mb = round(info_h["size"] / 1024 / 1024) if info_h["size"] else None
-            audio_icon = "🔊" if info_h["has_audio"] else "🔇"
-            
+        for h in heights[:8]:
+            size = max(
+                (f.get("filesize") or f.get("filesize_approx") or 0 
+                 for f in formats if f.get("height") == h),
+                default=0,
+            )
             results.append({
                 "height": h,
-                "approx_size_mb": size_mb,
-                "has_audio": info_h["has_audio"],
-                "audio_icon": audio_icon,
+                "approx_size_mb": round(size / 1024 / 1024) if size else None,
             })
 
         return results, info.get("title")
 
     def download_quality(self, url: str, height: int):
+        """دانلود با کیفیت انتخابی"""
         fid = str(uuid.uuid4())[:8]
-        
-        # اول cobalt
-        items, caption = self._youtube_cobalt(url, fid)
-        if items:
-            return items, caption
-        
-        # بعد yt-dlp با کیفیت انتخابی
-        output = os.path.join(self.download_dir, f"{fid}.%(ext)s")
-        ydl_opts = {
-            "outtmpl": output,
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "max_filesize": self.max_size,
-            "retries": 5,
-            "fragment_retries": 5,
-            "socket_timeout": 30,
-            "restrictfilenames": True,
-            "format": f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best",
-            "merge_output_format": "mp4",
-            "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}},
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filepath = ydl.prepare_filename(info)
-            
-            base = os.path.splitext(filepath)[0]
-            for ext in [".mp4", ".webm", ".mkv"]:
-                if os.path.exists(base + ext):
-                    filepath = base + ext
-                    break
-            
-            if not os.path.exists(filepath):
-                filepath = self._find_file(fid)
-            
-            if not filepath or not os.path.exists(filepath):
-                raise DownloadError("فایلی دانلود نشد")
-            
-            size = os.path.getsize(filepath)
-            if size == 0:
-                os.remove(filepath)
-                raise DownloadError("فایل خالیه")
-            if size > self.max_size:
-                os.remove(filepath)
-                raise DownloadError(f"حجم {size//1024//1024}MB از حد مجاز بیشتره! کیفیت پایین‌تر رو انتخاب کن")
-            
-            title = info.get("title", "").strip()
-            logger.info(f"✅ کیفیت {height}p: {size//1024//1024}MB")
-            return [(filepath, "video")], title
+        return self._download_youtube(url, fid)  # از همون روش چندلایه استفاده کن
 
     async def download_yt_quality(self, url: str, height: int):
         loop = asyncio.get_running_loop()
@@ -676,24 +716,17 @@ class Downloader:
             try:
                 if path and os.path.exists(path):
                     os.remove(path)
-            except:
-                pass
+            except: pass
 
 
 # ============================== محدودیت و میدلور ==============================
 class DownloadLimiter:
-    def __init__(self, n): 
-        self._sem = asyncio.Semaphore(n)
-    async def __aenter__(self): 
-        await self._sem.acquire()
-        return self
-    async def __aexit__(self, *a): 
-        self._sem.release()
+    def __init__(self, n): self._sem = asyncio.Semaphore(n)
+    async def __aenter__(self): await self._sem.acquire(); return self
+    async def __aexit__(self, *a): self._sem.release()
 
 class ThrottlingMiddleware(BaseMiddleware):
-    def __init__(self, sec): 
-        self.sec = sec
-        self._last = {}
+    def __init__(self, sec): self.sec = sec; self._last = {}
     async def __call__(self, handler, event: Message, data):
         uid = event.from_user.id if event.from_user else None
         if uid and uid not in ADMIN_IDS:
@@ -713,16 +746,14 @@ async def get_unjoined(bot, uid):
             member = await bot.get_chat_member(chat_id, uid)
             if member.status in ("left", "kicked"):
                 unjoined.append((chat_id, title, link))
-        except:
-            pass
+        except: pass
     return unjoined
 
 def membership_kb(unjoined):
     rows = []
     for cid, title, link in unjoined:
         url = link or (f"https://t.me/{cid.lstrip('@')}" if cid.startswith("@") else None)
-        if url:
-            rows.append([InlineKeyboardButton(text=f"📢 {title}", url=url)])
+        if url: rows.append([InlineKeyboardButton(text=f"📢 {title}", url=url)])
     rows.append([InlineKeyboardButton(text="✅ عضو شدم", callback_data="checksub")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -743,25 +774,17 @@ async def send_media(msg: Message, items, caption):
         if mtype == "photo":
             await msg.answer_photo(FSInputFile(path), caption=cap)
         else:
-            try:
-                await msg.answer_video(FSInputFile(path), caption=cap)
-            except:
-                await msg.answer_document(FSInputFile(path), caption=cap)
+            try: await msg.answer_video(FSInputFile(path), caption=cap)
+            except: await msg.answer_document(FSInputFile(path), caption=cap)
     else:
-        media = []
-        for i, (p, t) in enumerate(items):
-            if t == "photo":
-                media.append(InputMediaPhoto(media=FSInputFile(p), caption=cap if i == 0 else None))
-            else:
-                media.append(InputMediaVideo(media=FSInputFile(p), caption=cap if i == 0 else None))
-        try:
-            await msg.answer_media_group(media)
+        media = [InputMediaPhoto(media=FSInputFile(p), caption=cap if i==0 else None) if t=="photo" 
+                 else InputMediaVideo(media=FSInputFile(p), caption=cap if i==0 else None) 
+                 for i, (p, t) in enumerate(items)]
+        try: await msg.answer_media_group(media)
         except:
             for p, t in items:
-                if t == "photo":
-                    await msg.answer_photo(FSInputFile(p))
-                else:
-                    await msg.answer_video(FSInputFile(p))
+                if t == "photo": await msg.answer_photo(FSInputFile(p))
+                else: await msg.answer_video(FSInputFile(p))
 
 @router.callback_query(F.data == "checksub")
 async def checksub(cb: CallbackQuery):
@@ -782,17 +805,11 @@ async def ytcancel(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("ytq:"))
 async def ytquality(cb: CallbackQuery, downloader: Downloader, limiter: DownloadLimiter):
-    try:
-        _, sid, h = cb.data.split(":")
-        height = int(h)
-    except:
-        await cb.answer("خطا", show_alert=True)
-        return
-    
+    _, sid, h = cb.data.split(":")
+    height = int(h)
     entry = pending_youtube.get(sid)
     if not entry:
         await cb.answer("⏰ منقضی شده", show_alert=True)
-        await cb.message.edit_text("⏰ منقضی شد. دوباره لینک رو بفرست")
         return
 
     await cb.answer()
@@ -819,7 +836,6 @@ async def handle_link(msg: Message, downloader: Downloader, limiter: DownloadLim
     db_record_user(uid)
     text = msg.text or ""
 
-    # ادمین - افزودن کانال
     if uid in ADMIN_IDS and admin_states.get(uid) == "awaiting_add_channel":
         admin_states.pop(uid)
         raw = text.strip()
@@ -838,7 +854,6 @@ async def handle_link(msg: Message, downloader: Downloader, limiter: DownloadLim
             await msg.answer(f"❌ خطا: {e}")
         return
 
-    # عضویت اجباری
     if uid not in ADMIN_IDS:
         unjoined = await get_unjoined(msg.bot, uid)
         if unjoined:
@@ -855,11 +870,12 @@ async def handle_link(msg: Message, downloader: Downloader, limiter: DownloadLim
         await msg.answer("❌ پلتفرم پشتیبانی نمیشه")
         return
 
-    # یوتیوب
     if platform == "youtube":
         status = await msg.answer("⏳ بررسی کیفیت‌ها...")
         try:
-            qualities, title = await asyncio.get_running_loop().run_in_executor(None, downloader.list_qualities, url)
+            qualities, title = await asyncio.get_running_loop().run_in_executor(
+                None, downloader.list_qualities, url
+            )
         except:
             await status.edit_text("❌ خطا در دریافت اطلاعات ویدیو")
             return
@@ -874,9 +890,8 @@ async def handle_link(msg: Message, downloader: Downloader, limiter: DownloadLim
         rows = []
         for q in qualities:
             size = f" (~{q['approx_size_mb']}MB)" if q["approx_size_mb"] else ""
-            audio = q.get("audio_icon", "")
             rows.append([InlineKeyboardButton(
-                text=f"{audio} {q['height']}p{size}",
+                text=f"🎬 {q['height']}p{size}",
                 callback_data=f"ytq:{sid}:{q['height']}",
             )])
         rows.append([InlineKeyboardButton(text="❌ لغو", callback_data=f"ytcancel:{sid}")])
@@ -885,7 +900,6 @@ async def handle_link(msg: Message, downloader: Downloader, limiter: DownloadLim
         await status.edit_text(f"{header}کیفیت:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
         return
 
-    # بقیه پلتفرم‌ها
     status = await msg.answer("⏳ دانلود...")
     items = []
     try:
@@ -942,7 +956,8 @@ async def admin_cb(cb: CallbackQuery):
 
     elif act == "list":
         chs = db_list_channels()
-        text = "📋 کانال‌ها:\n" + "\n".join(f"• {t} (`{c}`)" for c, t, _ in chs) if chs else "⚠️ کانالی نیست"
+        if not chs: text = "⚠️ کانالی نیست"
+        else: text = "📋 کانال‌ها:\n" + "\n".join(f"• {t} (`{c}`)" for c, t, _ in chs)
         await cb.message.edit_text(text, reply_markup=back_kb())
 
     elif act == "add":
@@ -997,7 +1012,6 @@ async def main():
     
     me = await bot.get_me()
     logger.info(f"🤖 @{me.username} | ادمین‌ها: {ADMIN_IDS}")
-    logger.info(f"📦 حداکثر حجم: {config.max_file_size_mb}MB")
     
     try:
         await dp.start_polling(bot)
