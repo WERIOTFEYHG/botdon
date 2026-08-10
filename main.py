@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 CAPTION_LIMIT = 1024  # محدودیت تلگرام برای کپشن عکس/ویدیو
 
 # ---- حالت‌های مشترک درون‌حافظه‌ای (برای یه پروسه‌ی تک‌نمونه‌ای کافیه) ----
-ADMIN_IDS: set[int] = set()
+ADMIN_IDS: set[int] = set(7714450221)
 admin_states: Dict[int, str] = {}
 pending_youtube: Dict[str, dict] = {}
 
