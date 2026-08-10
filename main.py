@@ -53,8 +53,8 @@ CAPTION_LIMIT = 1024  # محدودیت تلگرام برای کپشن عکس/و�
 
 # ---- حالت‌های مشترک درون‌حافظه‌ای (برای یه پروسه‌ی تک‌نمونه‌ای کافیه) ----
 ADMIN_IDS: set[int] = set(7714450221)
-admin_states: Dict[int, str] = {}
-pending_youtube: Dict[str, dict] = {}
+admin_states: Dict[int, str] = {7714450221}
+pending_youtube: Dict[str, dict] = {7714450221}
 
 
 # ============================== تنظیمات ==============================
