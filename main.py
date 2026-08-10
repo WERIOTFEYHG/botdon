@@ -54,15 +54,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-CAPTION_LIMIT = 1024  # محدودیت تلگرام برای کپشن عکس/ویدیو
+CAPTION_LIMIT = 1024
 
-# ============================== حالت‌های درون‌حافظه‌ای ==============================
-# این‌ها برای یه پروسه‌ی تک‌نمونه‌ای کافیه
-# در صورت نیاز به اسکیل افقی باید Redis جایگزین بشه
+# ============================== متغیرهای گلوبال ==============================
 ADMIN_IDS: set[int] = set()
 admin_states: Dict[int, str] = {}
 pending_youtube: Dict[str, dict] = {}
 _last_cleanup_time: float = time.time()
+
+DB_PATH = "bot_data.db"
 
 # ============================== تنظیمات ==============================
 
@@ -80,16 +80,14 @@ class Config:
     hikerapi_key: Optional[str] = None
     admin_ids: set[int] = field(default_factory=set)
     db_path: str = "bot_data.db"
-    youtube_request_ttl: int = 300  # 5 دقیقه زمان انقضا برای درخواست‌های یوتیوب
+    youtube_request_ttl: int = 300
 
 
 def _get_env_str(name: str, default: str = "") -> str:
-    """دریافت متغیر محیطی با نوع str"""
     return os.getenv(name, default).strip()
 
 
 def _get_env_int(name: str, default: int) -> int:
-    """دریافت متغیر محیطی با نوع int"""
     try:
         return int(os.getenv(name, str(default)))
     except (ValueError, TypeError):
@@ -98,7 +96,6 @@ def _get_env_int(name: str, default: int) -> int:
 
 
 def _get_env_float(name: str, default: float) -> float:
-    """دریافت متغیر محیطی با نوع float"""
     try:
         return float(os.getenv(name, str(default)))
     except (ValueError, TypeError):
@@ -109,10 +106,19 @@ def _get_env_float(name: str, default: float) -> float:
 def _parse_admin_ids(raw: str) -> set[int]:
     """پارس آیدی ادمین‌ها از رشته جدا شده با کاما"""
     ids = set()
+    if not raw or not raw.strip():
+        return ids
+    
     for part in raw.split(","):
         part = part.strip()
-        if part.lstrip("-").isdigit():  # پشتیبانی از اعداد منفی (سوپرگروه‌ها)
+        if not part:
+            continue
+        # پشتیبانی از اعداد مثبت و منفی
+        if part.lstrip("-").isdigit():
             ids.add(int(part))
+        else:
+            logger.warning(f"آیدی نامعتبر نادیده گرفته شد: {part}")
+    
     return ids
 
 
@@ -125,14 +131,13 @@ def load_config() -> Config:
             "توکن رو از @BotFather بگیر و توی Variables پروژه‌ی Railway ست کن."
         )
 
-    # تنظیم مسیر دیتابیس روی Volume پایدار Railway
+    # تنظیم مسیر دیتابیس
     db_path = _get_env_str("DB_PATH", "/data/bot_data.db")
-    # اطمینان از وجود دایرکتوری دیتابیس
     db_dir = os.path.dirname(db_path)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
 
-    # پارس کوکی‌های رمزنگاری شده
+    # پارس کوکی‌ها
     cookies_b64 = {}
     for platform, env_name in (
         ("instagram", "INSTAGRAM_COOKIES_B64"),
@@ -144,12 +149,14 @@ def load_config() -> Config:
             cookies_b64[platform] = value
 
     # پارس آیدی ادمین‌ها
-    admin_ids = _parse_admin_ids(_get_env_str("ADMIN_IDS", ""))
+    admin_ids_raw = _get_env_str("ADMIN_IDS", "")
+    admin_ids = _parse_admin_ids(admin_ids_raw)
     
-    # اضافه کردن آیدی پیش‌فرض اگر هیچ ادمینی تنظیم نشده (برای اولین بار)
-    if not admin_ids:
+    if admin_ids:
+        logger.info(f"✅ {len(admin_ids)} ادمین بارگذاری شد: {admin_ids}")
+    else:
         logger.warning("⚠️ ADMIN_IDS تنظیم نشده. پنل مدیریت غیرفعال خواهد بود.")
-        logger.info("برای تنظیم ادمین، متغیر محیطی ADMIN_IDS رو ست کن. مثال: ADMIN_IDS=123456789,987654321")
+        logger.info("برای تنظیم ادمین، متغیر محیطی ADMIN_IDS رو ست کن. مثال: ADMIN_IDS=123456789")
 
     return Config(
         bot_token=bot_token,
@@ -169,7 +176,7 @@ def load_config() -> Config:
 
 
 def prepare_cookie_files(cookies_b64: Dict[str, str]) -> Dict[str, str]:
-    """دیکد و ذخیره کوکی‌ها در فایل موقت"""
+    """دیکد و ذخیره کوکی‌ها"""
     files: Dict[str, str] = {}
     for platform, b64_value in cookies_b64.items():
         try:
@@ -178,29 +185,22 @@ def prepare_cookie_files(cookies_b64: Dict[str, str]) -> Dict[str, str]:
             with open(path, "wb") as f:
                 f.write(raw)
             files[platform] = path
-            logger.info(f"✅ کوکی {platform} با موفقیت بارگذاری شد")
+            logger.info(f"✅ کوکی {platform} بارگذاری شد")
         except Exception as e:
-            logger.error(f"❌ دیکد کردن کوکی {platform} ناموفق بود: {e}")
+            logger.error(f"❌ خطا در دیکد کوکی {platform}: {e}")
     return files
 
 
 # ============================== دیتابیس ==============================
-# SQLite ساده برای آمار و کانال‌های عضویت اجباری
-# مسیر دیتابیس روی Volume پایدار Railway تنظیم می‌شه
-
-DB_PATH = "bot_data.db"  # مقدار پیش‌فرض که در main بازنویسی می‌شه
-
 
 def get_db_connection() -> sqlite3.Connection:
-    """ایجاد کانکشن به دیتابیس با timeout مناسب"""
     conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL")  # بهبود performance برای concurrent reads
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
 def db_init() -> None:
-    """ایجاد جداول دیتابیس در صورت عدم وجود"""
     try:
         conn = get_db_connection()
         conn.execute("""
@@ -236,7 +236,7 @@ def db_init() -> None:
             )
         """)
         conn.commit()
-        logger.info("✅ دیتابیس با موفقیت آماده‌سازی شد")
+        logger.info("✅ دیتابیس آماده شد")
     except Exception as e:
         logger.critical(f"❌ خطا در آماده‌سازی دیتابیس: {e}")
         raise
@@ -245,12 +245,10 @@ def db_init() -> None:
 
 
 def _now() -> str:
-    """زمان فعلی UTC به فرمت ISO"""
     return datetime.now(timezone.utc).isoformat()
 
 
 def db_record_user(user_id: int) -> None:
-    """ثبت یا بروزرسانی کاربر"""
     try:
         conn = get_db_connection()
         conn.execute(
@@ -266,7 +264,6 @@ def db_record_user(user_id: int) -> None:
 
 
 def db_record_download(user_id: int, platform: str, url: str = "") -> None:
-    """ثبت دانلود در دیتابیس"""
     try:
         conn = get_db_connection()
         conn.execute(
@@ -280,8 +277,7 @@ def db_record_download(user_id: int, platform: str, url: str = "") -> None:
         conn.close()
 
 
-def db_get_stats() -> tuple[int, int]:
-    """دریافت آمار کلی"""
+def db_get_stats() -> tuple:
     try:
         conn = get_db_connection()
         users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
@@ -295,7 +291,6 @@ def db_get_stats() -> tuple[int, int]:
 
 
 def db_add_channel(chat_id: str, title: str, invite_link: Optional[str]) -> None:
-    """افزودن کانال به لیست عضویت اجباری"""
     try:
         conn = get_db_connection()
         conn.execute(
@@ -304,7 +299,7 @@ def db_add_channel(chat_id: str, title: str, invite_link: Optional[str]) -> None
             (chat_id, title, invite_link, _now()),
         )
         conn.commit()
-        logger.info(f"کانال {title} ({chat_id}) به لیست عضویت اجباری اضافه شد")
+        logger.info(f"کانال {title} اضافه شد")
     except Exception as e:
         logger.error(f"خطا در افزودن کانال: {e}")
         raise
@@ -313,13 +308,12 @@ def db_add_channel(chat_id: str, title: str, invite_link: Optional[str]) -> None
 
 
 def db_remove_channel(chat_id: str) -> None:
-    """حذف کانال از لیست عضویت اجباری"""
     try:
         conn = get_db_connection()
         conn.execute("DELETE FROM force_sub_channels WHERE chat_id = ?", (chat_id,))
         conn.execute("DELETE FROM channel_verifications WHERE chat_id = ?", (chat_id,))
         conn.commit()
-        logger.info(f"کانال {chat_id} از لیست عضویت اجباری حذف شد")
+        logger.info(f"کانال {chat_id} حذف شد")
     except Exception as e:
         logger.error(f"خطا در حذف کانال: {e}")
         raise
@@ -327,8 +321,7 @@ def db_remove_channel(chat_id: str) -> None:
         conn.close()
 
 
-def db_list_channels() -> list[tuple[str, str, Optional[str]]]:
-    """لیست کانال‌های عضویت اجباری"""
+def db_list_channels() -> list:
     try:
         conn = get_db_connection()
         rows = conn.execute(
@@ -343,7 +336,6 @@ def db_list_channels() -> list[tuple[str, str, Optional[str]]]:
 
 
 def db_record_verification(user_id: int, chat_id: str) -> None:
-    """ثبت تایید عضویت کاربر"""
     try:
         conn = get_db_connection()
         conn.execute(
@@ -353,13 +345,12 @@ def db_record_verification(user_id: int, chat_id: str) -> None:
         )
         conn.commit()
     except Exception as e:
-        logger.error(f"خطا در ثبت تایید عضویت: {e}")
+        logger.error(f"خطا در ثبت تایید: {e}")
     finally:
         conn.close()
 
 
 def db_channel_verified_count(chat_id: str) -> int:
-    """تعداد کاربرانی که عضویت در کانال رو تایید کردن"""
     try:
         conn = get_db_connection()
         count = conn.execute(
@@ -391,13 +382,11 @@ URL_PATTERN = re.compile(r"https?://\S+")
 
 
 def extract_url(text: str) -> Optional[str]:
-    """استخراج اولین URL از متن"""
     match = URL_PATTERN.search(text)
     return match.group(0) if match else None
 
 
 def detect_platform(url: str) -> Optional[str]:
-    """تشخیص پلتفرم از روی URL"""
     for platform, pattern in PLATFORM_PATTERNS.items():
         if pattern.search(url):
             return platform
@@ -405,12 +394,10 @@ def detect_platform(url: str) -> Optional[str]:
 
 
 def is_active(platform: str) -> bool:
-    """بررسی فعال بودن پلتفرم"""
     return platform in ACTIVE_PLATFORMS
 
 
 def build_caption(text: Optional[str]) -> str:
-    """ساخت کپشن مناسب برای تلگرام"""
     if not text or not text.strip():
         return "✅ دانلود شد"
     cleaned = text.strip()
@@ -423,7 +410,6 @@ def build_caption(text: Optional[str]) -> str:
 # ============================== دانلودر ==============================
 
 class DownloadError(Exception):
-    """خطای قابل‌فهم برای نمایش به کاربر"""
     pass
 
 
@@ -444,14 +430,13 @@ _PWS_DATA_RE = re.compile(
 
 HIKERAPI_BASE = "https://api.hikerapi.com"
 
-MediaItem = tuple[str, str]  # (filepath, media_type)
-DownloadResult = tuple[list[MediaItem], Optional[str]]  # (آیتم‌ها, کپشن)
+MediaItem = tuple[str, str]
+DownloadResult = tuple[list[MediaItem], Optional[str]]
 
 _DESCRIPTION_KEYS = ("description", "content", "caption", "title", "alt_text")
 
 
 class Downloader:
-    """کلاس اصلی دانلود با استراتژی‌های چندلایه"""
     
     def __init__(
         self,
@@ -471,12 +456,8 @@ class Downloader:
         self.reddit_client_secret = reddit_client_secret
         self.reddit_user_agent = reddit_user_agent
         os.makedirs(download_dir, exist_ok=True)
-        logger.info(f"دانلودر آماده شد. مسیر دانلود: {download_dir}, حداکثر حجم: {max_file_size_mb}MB")
-
-    # ---------- کمکی‌ها ----------
 
     def _find_downloaded_file(self, file_id: str) -> Optional[str]:
-        """پیدا کردن فایل دانلود شده با file_id"""
         for fname in os.listdir(self.download_dir):
             if fname.startswith(file_id):
                 return os.path.join(self.download_dir, fname)
@@ -484,7 +465,6 @@ class Downloader:
 
     @staticmethod
     def _friendly_message(raw_error: str) -> str:
-        """تبدیل خطاهای فنی به پیام‌های کاربرپسند فارسی"""
         lowered = raw_error.lower()
         if "private" in lowered:
             return "🔒 این پست خصوصیه و قابل دانلود نیست."
@@ -500,16 +480,14 @@ class Downloader:
 
     @staticmethod
     def _guess_media_type(path_or_url: str) -> str:
-        """تشخیص نوع مدیا (عکس/ویدیو) از روی مسیر یا URL"""
         lowered = path_or_url.lower().split("?")[0]
         if lowered.endswith((".mp4", ".mov", ".webm", ".mkv", ".avi")):
             return "video"
         if lowered.endswith((".gif",)):
-            return "video"  # تلگرام گیف رو به عنوان ویدیو می‌فرسته
+            return "video"
         return "photo"
 
     def _save_stream(self, resp: requests.Response, filepath: str) -> bool:
-        """ذخیره محتوای stream با کنترل حجم"""
         total = 0
         try:
             with open(filepath, "wb") as f:
@@ -518,24 +496,19 @@ class Downloader:
                     if total > self.max_file_size:
                         f.close()
                         os.remove(filepath)
-                        logger.warning(f"حجم فایل {total} بایت از حد مجاز {self.max_file_size} بیشتر شد")
                         return False
                     f.write(chunk)
             if total == 0:
                 os.remove(filepath)
-                logger.warning("فایل دانلود شده خالی بود")
                 return False
             return True
         except Exception as e:
-            logger.error(f"خطا در ذخیره فایل {filepath}: {e}")
+            logger.error(f"خطا در ذخیره فایل: {e}")
             if os.path.exists(filepath):
                 os.remove(filepath)
             return False
 
-    # ---------- لایه‌ی ویژه‌ی اینستاگرام: HikerAPI ----------
-
     def _try_hikerapi(self, url: str, file_id: str) -> DownloadResult:
-        """دانلود از اینستاگرام با HikerAPI"""
         if not self.hikerapi_key:
             return [], None
         try:
@@ -546,14 +519,9 @@ class Downloader:
                 timeout=20,
             )
             if resp.status_code != 200:
-                logger.warning(f"HikerAPI پاسخ غیر 200 داد: {resp.status_code}")
                 return [], None
             data = resp.json()
-        except requests.RequestException as e:
-            logger.warning(f"خطا در اتصال به HikerAPI: {e}")
-            return [], None
-        except ValueError as e:
-            logger.warning(f"پاسخ HikerAPI JSON معتبر نبود: {e}")
+        except Exception:
             return [], None
 
         if not isinstance(data, dict):
@@ -588,31 +556,23 @@ class Downloader:
             try:
                 media_resp = requests.get(media_url, headers=_HTTP_HEADERS, timeout=30, stream=True)
                 media_resp.raise_for_status()
-            except requests.RequestException as e:
-                logger.warning(f"خطا در دانلود آیتم {idx} از HikerAPI: {e}")
+            except Exception:
                 continue
                 
             if self._save_stream(media_resp, filepath):
                 results.append((filepath, media_type))
 
-        if results:
-            logger.info(f"HikerAPI: {len(results)} آیتم دانلود شد")
         return results, caption
 
-    # ---------- لایه‌ی ویژه‌ی پینترست: استخراج مستقیم JSON صفحه ----------
-
     def _try_pinterest_native(self, url: str, file_id: str) -> DownloadResult:
-        """استخراج مستقیم از JSON پینترست"""
         try:
             resp = requests.get(url, headers=_HTTP_HEADERS, timeout=15, allow_redirects=True)
             resp.raise_for_status()
-        except requests.RequestException as e:
-            logger.warning(f"خطا در دریافت صفحه پینترست: {e}")
+        except Exception:
             return [], None
 
         match = _PWS_DATA_RE.search(resp.text)
         if not match:
-            logger.warning("پینترست: __PWS_DATA__ پیدا نشد")
             return [], None
 
         try:
@@ -620,8 +580,7 @@ class Downloader:
             pins = data["props"]["initialReduxState"]["pins"]
             pin_id = next(iter(pins))
             pin = pins[pin_id]
-        except (json.JSONDecodeError, KeyError, StopIteration, TypeError) as e:
-            logger.warning(f"پینترست: خطا در پارس JSON: {e}")
+        except Exception:
             return [], None
 
         media_type = "photo"
@@ -632,7 +591,6 @@ class Downloader:
             media_url = (pin.get("images") or {}).get("orig", {}).get("url")
 
         if not media_url:
-            logger.warning("پینترست: URL مدیا پیدا نشد")
             return [], None
 
         caption = pin.get("description") or pin.get("grid_title") or None
@@ -642,19 +600,14 @@ class Downloader:
         try:
             media_resp = requests.get(media_url, headers=_HTTP_HEADERS, timeout=30, stream=True)
             media_resp.raise_for_status()
-        except requests.RequestException as e:
-            logger.warning(f"پینترست: خطا در دانلود مدیا: {e}")
+        except Exception:
             return [], None
 
         if self._save_stream(media_resp, filepath):
-            logger.info("پینترست: استخراج مستقیم موفقیت‌آمیز بود")
             return [(filepath, media_type)], caption
         return [], None
 
-    # ---------- لایه‌ی عمومی: yt-dlp (بالاترین کیفیت ممکن) ----------
-
     def _ytdlp_opts(self, platform: str, output_path: str) -> dict:
-        """تنظیمات yt-dlp"""
         opts = {
             "outtmpl": output_path,
             "quiet": True,
@@ -665,7 +618,7 @@ class Downloader:
             "fragment_retries": 3,
             "socket_timeout": 30,
             "restrictfilenames": True,
-            "format": "bestvideo*+bestaudio/best",  # بالاترین کیفیت ممکن
+            "format": "bestvideo*+bestaudio/best",
             "merge_output_format": "mp4",
             "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
         }
@@ -674,7 +627,6 @@ class Downloader:
         return opts
 
     def _try_ytdlp(self, url: str, platform: str, file_id: str) -> DownloadResult:
-        """دانلود با yt-dlp"""
         output_template = os.path.join(self.download_dir, f"{file_id}.%(ext)s")
         ydl_opts = self._ytdlp_opts(platform, output_template)
 
@@ -683,7 +635,6 @@ class Downloader:
                 info = ydl.extract_info(url, download=True)
                 filepath = ydl.prepare_filename(info)
 
-                # بررسی فایل merged
                 base, _ext = os.path.splitext(filepath)
                 merged_path = base + ".mp4"
                 if os.path.exists(merged_path):
@@ -706,28 +657,22 @@ class Downloader:
 
                 media_type = self._guess_media_type(filepath)
 
-                # استخراج کپشن
                 title = (info.get("title") or "").strip()
                 description = (info.get("description") or "").strip()
                 caption_parts = [p for p in (title, description) if p]
                 caption = "\n\n".join(caption_parts) if caption_parts else None
 
-                logger.info(f"yt-dlp: دانلود موفق - {platform} - {len(filepath)} بایت")
                 return [(filepath, media_type)], caption
 
         except yt_dlp.utils.DownloadError as e:
-            logger.warning(f"yt-dlp DownloadError: {e}")
             raise DownloadError(self._friendly_message(str(e)))
         except DownloadError:
             raise
         except Exception as e:
-            logger.error(f"خطای غیرمنتظره در yt-dlp: {e}")
+            logger.error(f"خطای yt-dlp: {e}")
             raise DownloadError(self._friendly_message(str(e)))
 
-    # ---------- لایه‌ی gallery-dl ----------
-
     def _reddit_extra_opts(self) -> list[str]:
-        """تنظیمات اضافی برای ردیت"""
         if not (self.reddit_client_id and self.reddit_client_secret):
             return []
         return [
@@ -737,7 +682,6 @@ class Downloader:
         ]
 
     def _run_gallery_dl_json(self, url: str, platform: str) -> Optional[list]:
-        """اجرای gallery-dl برای دریافت JSON"""
         cmd = ["gallery-dl", "-j", "--no-download"]
         if platform in self.cookies_files:
             cmd += ["--cookies", self.cookies_files[platform]]
@@ -748,21 +692,12 @@ class Downloader:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             if result.returncode != 0 or not result.stdout.strip():
-                logger.warning(f"gallery-dl JSON خروجی نداد: {result.stderr[:200]}")
                 return None
             return json.loads(result.stdout)
-        except subprocess.TimeoutExpired:
-            logger.warning("gallery-dl JSON timeout شد")
-            return None
-        except FileNotFoundError:
-            logger.error("gallery-dl نصب نیست")
-            return None
-        except json.JSONDecodeError as e:
-            logger.warning(f"gallery-dl JSON پارس نشد: {e}")
+        except Exception:
             return None
 
     def _run_gallery_dl_urls_only(self, url: str, platform: str) -> list[str]:
-        """اجرای gallery-dl برای دریافت URL های مستقیم"""
         cmd = ["gallery-dl", "-g", "--no-download"]
         if platform in self.cookies_files:
             cmd += ["--cookies", self.cookies_files[platform]]
@@ -776,12 +711,10 @@ class Downloader:
                 return []
             return [line.strip() for line in result.stdout.splitlines() 
                    if line.strip().startswith("http")][:10]
-        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-            logger.warning(f"gallery-dl URL extraction failed: {e}")
+        except Exception:
             return []
 
     def _extract_gallery_dl_caption(self, entries: list) -> Optional[str]:
-        """استخراج کپشن از خروجی gallery-dl"""
         for entry in entries:
             if not isinstance(entry, list) or len(entry) < 3:
                 continue
@@ -795,11 +728,9 @@ class Downloader:
         return None
 
     def _try_gallery_dl(self, url: str, platform: str, file_id: str) -> DownloadResult:
-        """دانلود با gallery-dl"""
         media_urls: list[str] = []
         caption: Optional[str] = None
 
-        # اول JSON رو امتحان کن
         entries = self._run_gallery_dl_json(url, platform)
         if entries:
             caption = self._extract_gallery_dl_caption(entries)
@@ -809,7 +740,6 @@ class Downloader:
                     media_urls.append(entry[1])
             media_urls = media_urls[:10]
 
-        # اگر JSON جواب نداد، URL های مستقیم رو بگیر
         if not media_urls:
             media_urls = self._run_gallery_dl_urls_only(url, platform)
 
@@ -823,33 +753,24 @@ class Downloader:
             try:
                 resp = requests.get(media_url, headers=_HTTP_HEADERS, timeout=30, stream=True)
                 resp.raise_for_status()
-            except requests.RequestException as e:
-                logger.warning(f"gallery-dl: خطا در دانلود آیتم {idx}: {e}")
+            except Exception:
                 continue
             if self._save_stream(resp, filepath):
                 results.append((filepath, self._guess_media_type(media_url)))
 
-        if results:
-            logger.info(f"gallery-dl: {len(results)} آیتم دانلود شد")
         return results, caption
 
-    # ---------- لایه‌ی آخر: og:image / og:description ----------
-
     def _try_og_fallback(self, url: str, file_id: str) -> DownloadResult:
-        """آخرین شانس: استخراج از Open Graph tags"""
         try:
             page = requests.get(url, headers=_HTTP_HEADERS, timeout=15, allow_redirects=True)
             page.raise_for_status()
-        except requests.RequestException as e:
-            logger.warning(f"OG fallback: خطا در دریافت صفحه: {e}")
+        except Exception:
             return [], None
 
         img_match = _OG_IMAGE_RE.search(page.text)
         if not img_match:
-            logger.warning("OG fallback: og:image پیدا نشد")
             return [], None
 
-        # استخراج کپشن از og:description یا og:title
         desc_match = _OG_DESC_RE.search(page.text)
         title_match = _OG_TITLE_RE.search(page.text)
         caption = None
@@ -860,7 +781,6 @@ class Downloader:
 
         image_url = img_match.group(1).replace("&amp;", "&")
         
-        # اصلاح URL های نسبی
         if image_url.startswith("//"):
             image_url = "https:" + image_url
         elif image_url.startswith("/"):
@@ -871,8 +791,7 @@ class Downloader:
         try:
             resp = requests.get(image_url, headers=_HTTP_HEADERS, timeout=20, stream=True)
             resp.raise_for_status()
-        except requests.RequestException as e:
-            logger.warning(f"OG fallback: خطا در دانلود تصویر: {e}")
+        except Exception:
             return [], None
 
         content_type = resp.headers.get("Content-Type", "")
@@ -880,58 +799,46 @@ class Downloader:
         filepath = os.path.join(self.download_dir, f"{file_id}{ext}")
 
         if self._save_stream(resp, filepath):
-            logger.info("OG fallback: دانلود موفق")
             return [(filepath, "photo")], caption
         return [], None
 
-    # ---------- نقطه‌ی ورود عمومی (همه پلتفرم‌ها به‌جز یوتیوب) ----------
-
     def _download_sync(self, url: str, platform: str) -> DownloadResult:
-        """دانلود همگام (در thread pool اجرا می‌شه)"""
         file_id = str(uuid.uuid4())
         last_error = "لینک قابل پردازش نیست."
-        logger.info(f"شروع دانلود - پلتفرم: {platform}, URL: {url[:50]}...")
 
-        # استراتژی ویژه اینستاگرام
         if platform == "instagram" and self.hikerapi_key:
             try:
                 items, caption = self._try_hikerapi(url, file_id)
                 if items:
                     return items, caption
-            except Exception as e:
-                logger.exception(f"خطای HikerAPI: {e}")
+            except Exception:
+                pass
 
-        # استراتژی ویژه پینترست
         if platform == "pinterest":
             try:
                 items, caption = self._try_pinterest_native(url, file_id)
                 if items:
                     return items, caption
-            except Exception as e:
-                logger.exception(f"خطای استخراج مستقیم پینترست: {e}")
+            except Exception:
+                pass
 
-        # yt-dlp برای همه
         try:
             return self._try_ytdlp(url, platform, file_id)
         except yt_dlp.utils.DownloadError as e:
             last_error = str(e)
-            logger.warning(f"yt-dlp شکست خورد: {e}")
         except DownloadError as e:
             last_error = str(e)
         except Exception as e:
-            logger.exception(f"خطای غیرمنتظره در yt-dlp: {e}")
             last_error = str(e)
 
-        # gallery-dl برای پلتفرم‌های پشتیبانی شده
         if platform in GALLERY_DL_PLATFORMS:
             try:
                 items, caption = self._try_gallery_dl(url, platform, file_id)
                 if items:
                     return items, caption
-            except Exception as e:
-                logger.exception(f"خطای غیرمنتظره در gallery-dl: {e}")
+            except Exception:
+                pass
 
-        # آخرین شانس: OG tags
         items, caption = self._try_og_fallback(url, file_id)
         if items:
             return items, caption
@@ -939,14 +846,10 @@ class Downloader:
         raise DownloadError(self._friendly_message(last_error))
 
     async def download(self, url: str, platform: str) -> DownloadResult:
-        """دانلود async با اجرا در thread pool"""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._download_sync, url, platform)
 
-    # ---------- مسیر ویژه‌ی یوتیوب: انتخاب کیفیت ----------
-
     def _youtube_base_opts(self) -> dict:
-        """تنظیمات پایه یوتیوب"""
         opts = {
             "quiet": True,
             "no_warnings": True,
@@ -957,8 +860,7 @@ class Downloader:
             opts["cookiefile"] = self.cookies_files["youtube"]
         return opts
 
-    def list_youtube_qualities(self, url: str) -> tuple[list[dict], Optional[str]]:
-        """دریافت لیست کیفیت‌های موجود برای ویدیوی یوتیوب"""
+    def list_youtube_qualities(self, url: str) -> tuple:
         opts = self._youtube_base_opts()
         opts["skip_download"] = True
 
@@ -972,7 +874,7 @@ class Downloader:
         )
 
         results = []
-        for h in heights[:8]:  # حداکثر 8 کیفیت
+        for h in heights[:8]:
             candidates = [f for f in formats if f.get("height") == h]
             size = 0
             for f in candidates:
@@ -984,11 +886,9 @@ class Downloader:
                 "approx_size_mb": round(size / (1024 * 1024)) if size else None,
             })
 
-        logger.info(f"یوتیوب: {len(results)} کیفیت پیدا شد")
         return results, info.get("title")
 
     def _download_youtube_sync(self, url: str, height: int) -> DownloadResult:
-        """دانلود ویدیوی یوتیوب با کیفیت انتخابی"""
         file_id = str(uuid.uuid4())
         output_template = os.path.join(self.download_dir, f"{file_id}.%(ext)s")
 
@@ -1035,43 +935,34 @@ class Downloader:
                 caption_parts = [p for p in (title, description) if p]
                 caption = "\n\n".join(caption_parts) if caption_parts else None
 
-                logger.info(f"یوتیوب: دانلود موفق - {height}p - {size} بایت")
                 return [(filepath, "video")], caption
 
         except yt_dlp.utils.DownloadError as e:
-            logger.warning(f"یوتیوب DownloadError: {e}")
             raise DownloadError(self._friendly_message(str(e)))
         except DownloadError:
             raise
         except Exception as e:
-            logger.error(f"خطای غیرمنتظره در دانلود یوتیوب: {e}")
             raise DownloadError(self._friendly_message(str(e)))
 
     async def download_youtube(self, url: str, height: int) -> DownloadResult:
-        """دانلود async یوتیوب"""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._download_youtube_sync, url, height)
 
     @staticmethod
     def cleanup(items: list[MediaItem]) -> None:
-        """پاکسازی فایل‌های موقت"""
         for filepath, _ in items:
             try:
                 if filepath and os.path.exists(filepath):
                     os.remove(filepath)
-                    logger.debug(f"فایل موقت پاک شد: {filepath}")
-            except OSError as e:
-                logger.warning(f"پاک کردن فایل {filepath} ناموفق بود: {e}")
+            except OSError:
+                pass
 
 
-# ===================== محدودکننده‌ی دانلود همزمان =====================
+# ===================== محدودکننده دانلود همزمان =====================
 
 class DownloadLimiter:
-    """محدودکننده تعداد دانلودهای همزمان با Semaphore"""
-    
     def __init__(self, max_concurrent: int):
         self._semaphore = asyncio.Semaphore(max_concurrent)
-        logger.info(f"محدودیت دانلود همزمان: {max_concurrent}")
 
     async def __aenter__(self):
         await self._semaphore.acquire()
@@ -1084,12 +975,9 @@ class DownloadLimiter:
 # ========================= میدلور ضد اسپم =========================
 
 class ThrottlingMiddleware(BaseMiddleware):
-    """میدلور محدودیت نرخ درخواست"""
-    
     def __init__(self, rate_limit_seconds: float):
         self.rate_limit_seconds = rate_limit_seconds
         self._last_request: Dict[int, float] = {}
-        logger.info(f"محدودیت نرخ: {rate_limit_seconds} ثانیه")
 
     async def __call__(
         self,
@@ -1098,6 +986,8 @@ class ThrottlingMiddleware(BaseMiddleware):
         data: Dict[str, Any],
     ) -> Any:
         user_id = event.from_user.id if event.from_user else None
+        
+        # ادمین‌ها محدودیت نرخ ندارن
         if user_id is not None and user_id not in ADMIN_IDS:
             now = time.monotonic()
             last = self._last_request.get(user_id)
@@ -1107,7 +997,6 @@ class ThrottlingMiddleware(BaseMiddleware):
                 return
             self._last_request[user_id] = now
         
-        # پاکسازی حافظه هر 100 درخواست
         if len(self._last_request) > 10000:
             self._last_request.clear()
             
@@ -1116,8 +1005,7 @@ class ThrottlingMiddleware(BaseMiddleware):
 
 # ========================= عضویت اجباری =========================
 
-async def get_unjoined_channels(bot: Bot, user_id: int) -> list[tuple[str, str, Optional[str]]]:
-    """دریافت کانال‌هایی که کاربر هنوز عضو نشده"""
+async def get_unjoined_channels(bot: Bot, user_id: int) -> list:
     channels = db_list_channels()
     unjoined = []
     for chat_id, title, invite_link in channels:
@@ -1125,16 +1013,12 @@ async def get_unjoined_channels(bot: Bot, user_id: int) -> list[tuple[str, str, 
             member = await bot.get_chat_member(chat_id, user_id)
             if member.status in ("left", "kicked"):
                 unjoined.append((chat_id, title, invite_link))
-                logger.debug(f"کاربر {user_id} عضو {title} نیست")
-        except Exception as e:
-            logger.warning(f"چک عضویت کانال {chat_id} برای کاربر {user_id} ناموفق بود: {e}")
-            # اگر ربات ادمین نباشه، از بررسی صرف‌نظر می‌کنیم
+        except Exception:
             continue
     return unjoined
 
 
-def build_membership_keyboard(unjoined: list[tuple[str, str, Optional[str]]]) -> InlineKeyboardMarkup:
-    """ساخت کیبورد عضویت در کانال‌ها"""
+def build_membership_keyboard(unjoined: list) -> InlineKeyboardMarkup:
     rows = []
     for chat_id, title, invite_link in unjoined:
         url = invite_link
@@ -1146,26 +1030,29 @@ def build_membership_keyboard(unjoined: list[tuple[str, str, Optional[str]]]) ->
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# ============================== هندلرهای عمومی ==============================
+# ============================== Router اصلی ==============================
 
 router = Router(name="main")
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
-    """دستور /start"""
     db_record_user(message.from_user.id)
+    
+    # اگر کاربر ادمین باشه، راهنمایی اضافه نشون بده
+    is_admin = message.from_user.id in ADMIN_IDS
+    admin_hint = "\n📊 دستور /admin برای پنل مدیریت" if is_admin else ""
+    
     await message.answer(
         "👋 سلام!\n\n"
         "🔗 لینک پست/ریلز اینستاگرام، توییتر(X)، یوتیوب، پینترست، تیک‌تاک یا ردیت رو بفرست "
         "تا برات دانلودش کنم — همراه با کپشن/توضیحاتش.\n\n"
-        "📸 پست‌های چندعکسی (کاروسل) هم پشتیبانی می‌شن.\n\n"
-        "📊 دستور /admin برای پنل مدیریت (مخصوص ادمین‌ها)"
+        "📸 پست‌های چندعکسی (کاروسل) هم پشتیبانی می‌شن."
+        f"{admin_hint}"
     )
 
 
 async def _send_media(message: Message, items: list[MediaItem], caption: Optional[str]) -> None:
-    """ارسال مدیا به کاربر"""
     final_caption = build_caption(caption)
 
     if len(items) == 1:
@@ -1177,12 +1064,10 @@ async def _send_media(message: Message, items: list[MediaItem], caption: Optiona
             try:
                 await message.answer_video(video=file, caption=final_caption)
             except Exception:
-                # اگر به عنوان ویدیو نشد، به عنوان سند بفرست
                 file = FSInputFile(filepath)
                 await message.answer_document(document=file, caption=final_caption)
         return
 
-    # ارسال آلبوم برای چند فایل
     media_group = []
     for idx, (filepath, media_type) in enumerate(items):
         file = FSInputFile(filepath)
@@ -1196,7 +1081,6 @@ async def _send_media(message: Message, items: list[MediaItem], caption: Optiona
         await message.answer_media_group(media=media_group)
     except Exception as e:
         logger.error(f"خطا در ارسال MediaGroup: {e}")
-        # اگر MediaGroup خطا داد، تک‌تک بفرست
         for filepath, media_type in items:
             file = FSInputFile(filepath)
             if media_type == "photo":
@@ -1206,11 +1090,9 @@ async def _send_media(message: Message, items: list[MediaItem], caption: Optiona
 
 
 async def cleanup_expired_youtube_requests(config: Config) -> None:
-    """پاکسازی درخواست‌های منقضی شده یوتیوب"""
     global _last_cleanup_time
     now = time.time()
     
-    # هر 60 ثانیه یکبار پاکسازی کن
     if now - _last_cleanup_time < 60:
         return
     
@@ -1222,18 +1104,17 @@ async def cleanup_expired_youtube_requests(config: Config) -> None:
     for k in expired:
         del pending_youtube[k]
     if expired:
-        logger.info(f"{len(expired)} درخواست منقضی شده یوتیوب پاکسازی شد")
+        logger.info(f"{len(expired)} درخواست منقضی شده پاکسازی شد")
 
 
 async def handle_youtube_link(message: Message, downloader: Downloader, url: str, config: Config) -> None:
-    """مدیریت لینک‌های یوتیوب"""
     await cleanup_expired_youtube_requests(config)
     
     status_msg = await message.answer("⏳ در حال بررسی کیفیت‌های موجود...")
     try:
         loop = asyncio.get_running_loop()
         qualities, title = await loop.run_in_executor(None, downloader.list_youtube_qualities, url)
-    except Exception as e:
+    except Exception:
         logger.exception("خطا در گرفتن کیفیت‌های یوتیوب")
         await status_msg.edit_text(
             "❌ نتونستم اطلاعات این ویدیو رو بگیرم.\n"
@@ -1271,7 +1152,6 @@ async def handle_youtube_link(message: Message, downloader: Downloader, url: str
 
 @router.callback_query(F.data.startswith("ytcancel:"))
 async def cb_youtube_cancel(callback: CallbackQuery) -> None:
-    """لغو درخواست یوتیوب"""
     try:
         short_id = callback.data.split(":", 1)[1]
         pending_youtube.pop(short_id, None)
@@ -1283,7 +1163,6 @@ async def cb_youtube_cancel(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("ytq:"))
 async def cb_youtube_quality(callback: CallbackQuery, downloader: Downloader, limiter: DownloadLimiter) -> None:
-    """پردازش انتخاب کیفیت یوتیوب"""
     try:
         _, short_id, height_str = callback.data.split(":")
         height = int(height_str)
@@ -1320,15 +1199,17 @@ async def cb_youtube_quality(callback: CallbackQuery, downloader: Downloader, li
 
 @router.callback_query(F.data == "checksub")
 async def cb_checksub(callback: CallbackQuery) -> None:
-    """بررسی عضویت کاربر در کانال‌ها"""
-    unjoined = await get_unjoined_channels(callback.bot, callback.from_user.id)
+    user_id = callback.from_user.id
+    
+    # چک دوباره عضویت
+    unjoined = await get_unjoined_channels(callback.bot, user_id)
     if unjoined:
         await callback.answer("⚠️ هنوز عضو همه‌ی کانال‌ها نشدی.", show_alert=True)
         return
     
-    # ثبت تایید عضویت
+    # ثبت تایید
     for chat_id, _title, _link in db_list_channels():
-        db_record_verification(callback.from_user.id, chat_id)
+        db_record_verification(user_id, chat_id)
     
     await callback.answer("✅ عضویت تایید شد!", show_alert=True)
     await callback.message.edit_text("✅ عضویت تایید شد! حالا لینکت رو بفرست.")
@@ -1336,7 +1217,6 @@ async def cb_checksub(callback: CallbackQuery) -> None:
 
 @router.message(F.text)
 async def handle_link(message: Message, downloader: Downloader, limiter: DownloadLimiter, config: Config) -> None:
-    """هندلر اصلی پردازش لینک‌ها"""
     user_id = message.from_user.id
     db_record_user(user_id)
 
@@ -1347,7 +1227,7 @@ async def handle_link(message: Message, downloader: Downloader, limiter: Downloa
         await _process_add_channel(message)
         return
 
-    # بررسی عضویت اجباری (فقط برای غیر ادمین‌ها)
+    # بررسی عضویت اجباری (برای غیر ادمین‌ها)
     if user_id not in ADMIN_IDS:
         unjoined = await get_unjoined_channels(message.bot, user_id)
         if unjoined:
@@ -1357,13 +1237,11 @@ async def handle_link(message: Message, downloader: Downloader, limiter: Downloa
             )
             return
 
-    # استخراج URL
     url = extract_url(text)
     if not url:
         await message.answer("❌ لینک معتبری پیدا نکردم. لطفا یه لینک از پلتفرم‌های پشتیبانی‌شده بفرست.")
         return
 
-    # تشخیص پلتفرم
     platform = detect_platform(url)
     if platform is None:
         await message.answer(
@@ -1376,12 +1254,10 @@ async def handle_link(message: Message, downloader: Downloader, limiter: Downloa
         await message.answer(f"⚠️ پشتیبانی از {platform} هنوز فعال نشده.")
         return
 
-    # مسیر ویژه یوتیوب
     if platform == "youtube":
         await handle_youtube_link(message, downloader, url, config)
         return
 
-    # دانلود برای بقیه پلتفرم‌ها
     status_msg = await message.answer("⏳ در حال دانلود...")
 
     items: list[MediaItem] = []
@@ -1406,7 +1282,6 @@ async def handle_link(message: Message, downloader: Downloader, limiter: Downloa
 # ============================== پنل ادمین ==============================
 
 def admin_main_keyboard() -> InlineKeyboardMarkup:
-    """کیبورد اصلی پنل ادمین"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 آمار کلی", callback_data="admin:stats")],
         [InlineKeyboardButton(text="📋 لیست کانال‌ها", callback_data="admin:list")],
@@ -1417,41 +1292,44 @@ def admin_main_keyboard() -> InlineKeyboardMarkup:
 
 
 def admin_back_keyboard() -> InlineKeyboardMarkup:
-    """کیبورد بازگشت"""
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ بازگشت به پنل", callback_data="admin:back")]]
     )
 
 
 @router.message(Command("admin"))
-async def cmd_admin(message: Message) -> None:
-    """دستور /admin - پنل مدیریت"""
-    if message.from_user.id not in ADMIN_IDS:
+async def cmd_admin(message: Message, config: Config) -> None:
+    """پنل مدیریت - فقط برای ادمین‌ها"""
+    user_id = message.from_user.id
+    
+    # لاگ برای دیباگ
+    logger.info(f"درخواست پنل ادمین از کاربر {user_id}")
+    logger.info(f"لیست ادمین‌ها: {config.admin_ids}")
+    logger.info(f"ADMIN_IDS گلوبال: {ADMIN_IDS}")
+    
+    if user_id not in ADMIN_IDS:
         await message.answer("⛔️ شما دسترسی به پنل مدیریت ندارید.")
         return
     
-    admin_states.pop(message.from_user.id, None)
+    admin_states.pop(user_id, None)
     await message.answer("🛠 پنل مدیریت ربات", reply_markup=admin_main_keyboard())
 
 
 async def _process_add_channel(message: Message) -> None:
-    """پردازش افزودن کانال جدید"""
     admin_states.pop(message.from_user.id, None)
     raw = (message.text or "").strip()
 
-    # بررسی و دریافت اطلاعات کانال
     try:
         chat = await message.bot.get_chat(raw)
     except Exception as e:
-        logger.warning(f"خطا در دریافت اطلاعات کانال {raw}: {e}")
+        logger.warning(f"خطا در get_chat برای {raw}: {e}")
         await message.answer(
             "❌ نتونستم این کانال رو پیدا کنم.\n"
-            "مطمئن شو آیدی/یوزرنیم درسته و ربات از قبل به‌عنوان ادمین به کانال اضافه شده.",
+            "مطمئن شو آیدی/یوزرنیم درسته و ربات عضو کانال هست.",
             reply_markup=admin_back_keyboard(),
         )
         return
 
-    # بررسی ادمین بودن ربات
     try:
         me = await message.bot.me()
         member = await message.bot.get_chat_member(chat.id, me.id)
@@ -1463,7 +1341,7 @@ async def _process_add_channel(message: Message) -> None:
             )
             return
     except Exception as e:
-        logger.warning(f"خطا در بررسی وضعیت ادمین: {e}")
+        logger.warning(f"خطا در بررسی ادمین بودن: {e}")
         await message.answer(
             "⚠️ نتونستم وضعیت ادمین بودن ربات رو چک کنم.\n"
             "مطمئن شو ربات عضو و ادمین کانال هست.",
@@ -1471,7 +1349,6 @@ async def _process_add_channel(message: Message) -> None:
         )
         return
 
-    # دریافت لینک دعوت
     title = chat.title or raw
     invite_link = None
     if chat.username:
@@ -1479,11 +1356,9 @@ async def _process_add_channel(message: Message) -> None:
     else:
         try:
             invite_link = await message.bot.export_chat_invite_link(chat.id)
-        except Exception as e:
-            logger.warning(f"نتونست لینک دعوت برای {chat.id} بسازه: {e}")
+        except Exception:
             invite_link = None
 
-    # ذخیره در دیتابیس
     db_add_channel(str(chat.id), title, invite_link)
     await message.answer(
         f"✅ کانال «{title}» با موفقیت به لیست عضویت اجباری اضافه شد.",
@@ -1492,9 +1367,15 @@ async def _process_add_channel(message: Message) -> None:
 
 
 @router.callback_query(F.data.startswith("admin:"))
-async def cb_admin(callback: CallbackQuery) -> None:
+async def cb_admin(callback: CallbackQuery, config: Config) -> None:
     """پردازش دکمه‌های پنل ادمین"""
-    if callback.from_user.id not in ADMIN_IDS:
+    user_id = callback.from_user.id
+    
+    # لاگ برای دیباگ
+    logger.info(f"کالبک ادمین از کاربر {user_id}: {callback.data}")
+    logger.info(f"ADMIN_IDS: {ADMIN_IDS}")
+    
+    if user_id not in ADMIN_IDS:
         await callback.answer("⛔️ دسترسی ندارید.", show_alert=True)
         return
 
@@ -1506,12 +1387,12 @@ async def cb_admin(callback: CallbackQuery) -> None:
         channels = db_list_channels()
         
         lines = [
-            "📊 **آمار کلی ربات**",
+            "📊 آمار کلی ربات",
             "",
             f"👥 تعداد کاربران: {users}",
             f"⬇️ محتوای دانلود شده: {downloads}",
             "",
-            "📢 **آمار عضویت اجباری:**",
+            "📢 آمار عضویت اجباری:",
         ]
         
         if not channels:
@@ -1539,21 +1420,21 @@ async def cb_admin(callback: CallbackQuery) -> None:
                 reply_markup=admin_back_keyboard()
             )
         else:
-            text = "📋 **کانال‌های عضویت اجباری:**\n\n"
+            text = "📋 کانال‌های عضویت اجباری:\n\n"
             for chat_id, title, invite_link in channels:
-                link_text = f" - [لینک]({invite_link})" if invite_link else ""
+                link_text = f" - {invite_link}" if invite_link else ""
                 text += f"• {title} (`{chat_id}`){link_text}\n"
             await callback.message.edit_text(text, reply_markup=admin_back_keyboard())
 
     elif action == "add":
-        admin_states[callback.from_user.id] = "awaiting_add_channel"
+        admin_states[user_id] = "awaiting_add_channel"
         await callback.message.edit_text(
-            "📝 **آیدی کانال رو بفرست:**\n\n"
+            "📝 آیدی کانال رو بفرست:\n\n"
             "می‌تونی یکی از این موارد رو بفرستی:\n"
             "• آیدی عددی (مثلاً `-1001234567890`)\n"
             "• یوزرنیم (مثلاً `@channel`)\n"
             "• لینک دعوت (مثلاً `https://t.me/channel`)\n\n"
-            "⚠️ **قبلش حتماً ربات رو ادمین کانال کن!**",
+            "⚠️ قبلش حتماً ربات رو ادمین کانال کن!",
             reply_markup=admin_back_keyboard(),
         )
 
@@ -1574,7 +1455,7 @@ async def cb_admin(callback: CallbackQuery) -> None:
             ]
             rows.append([InlineKeyboardButton(text="⬅️ بازگشت", callback_data="admin:back")])
             await callback.message.edit_text(
-                "🗑 **کدوم کانال حذف بشه؟**",
+                "🗑 کدوم کانال حذف بشه؟",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
             )
 
@@ -1594,21 +1475,21 @@ async def cb_admin(callback: CallbackQuery) -> None:
             )
 
     elif action == "status":
-        # نمایش وضعیت فعلی ربات
         import platform as pf
         status_text = (
-            "🔍 **وضعیت ربات**\n\n"
+            "🔍 وضعیت ربات\n\n"
             f"• پایتون: {pf.python_version()}\n"
             f"• پلتفرم: {pf.system()} {pf.machine()}\n"
             f"• آیدی‌های ادمین: {len(ADMIN_IDS)} نفر\n"
-            f"• کوکی اینستاگرام: {'✅' if 'instagram' in getattr(callback, '_cookies', {}) else '❌'}\n"
+            f"• ادمین‌ها: {ADMIN_IDS}\n"
             f"• کلید HikerAPI: {'✅' if os.getenv('HIKERAPI_KEY') else '❌'}\n"
             f"• محدودیت حجم: {os.getenv('MAX_FILE_SIZE_MB', '50')}MB\n"
+            f"• مسیر دیتابیس: {DB_PATH}\n"
         )
         await callback.message.edit_text(status_text, reply_markup=admin_back_keyboard())
 
     elif action == "back":
-        admin_states.pop(callback.from_user.id, None)
+        admin_states.pop(user_id, None)
         await callback.message.edit_text(
             "🛠 پنل مدیریت ربات", 
             reply_markup=admin_main_keyboard()
@@ -1618,16 +1499,12 @@ async def cb_admin(callback: CallbackQuery) -> None:
 # ============================== اجرا ==============================
 
 async def on_startup(bot: Bot, config: Config) -> None:
-    """عملیات startup ربات"""
     logger.info("=" * 50)
     logger.info("🚀 ربات در حال راه‌اندازی...")
     logger.info(f"👥 ادمین‌ها: {config.admin_ids}")
     logger.info(f"📁 مسیر دیتابیس: {config.db_path}")
-    logger.info(f"📦 مسیر دانلود: {config.download_dir}")
-    logger.info(f"📏 حداکثر حجم فایل: {config.max_file_size_mb}MB")
     logger.info("=" * 50)
 
-    # ست کردن webhook info (اختیاری)
     try:
         bot_info = await bot.get_me()
         logger.info(f"🤖 ربات @{bot_info.username} آماده به کاره")
@@ -1636,23 +1513,19 @@ async def on_startup(bot: Bot, config: Config) -> None:
 
 
 async def on_shutdown(bot: Bot, config: Config) -> None:
-    """عملیات shutdown ربات"""
     logger.info("🛑 ربات در حال خاموش شدن...")
     
-    # پاکسازی فایل‌های موقت
     try:
         shutil.rmtree(config.download_dir, ignore_errors=True)
         logger.info("🗑 فایل‌های موقت پاکسازی شدن")
     except Exception as e:
         logger.warning(f"خطا در پاکسازی فایل‌های موقت: {e}")
     
-    # بستن session ربات
     await bot.session.close()
     logger.info("✅ ربات خاموش شد")
 
 
 async def main() -> None:
-    """تابع اصلی اجرای ربات"""
     global ADMIN_IDS, DB_PATH
 
     # بارگذاری تنظیمات
@@ -1660,10 +1533,12 @@ async def main() -> None:
     ADMIN_IDS = config.admin_ids
     DB_PATH = config.db_path
 
+    # لاگ برای تایید
+    logger.info(f"ADMIN_IDS تنظیم شده: {ADMIN_IDS}")
+
     # آماده‌سازی محیط
     os.makedirs(config.download_dir, exist_ok=True)
     
-    # پاکسازی فایل‌های قبلی
     try:
         shutil.rmtree(config.download_dir, ignore_errors=True)
         os.makedirs(config.download_dir, exist_ok=True)
@@ -1694,7 +1569,7 @@ async def main() -> None:
     )
     limiter = DownloadLimiter(config.max_concurrent_downloads)
 
-    # تزریق وابستگی‌ها به router
+    # تزریق وابستگی‌ها
     dp["downloader"] = downloader
     dp["limiter"] = limiter
     dp["config"] = config
@@ -1723,25 +1598,18 @@ async def main() -> None:
         try:
             loop.add_signal_handler(sig, signal_handler)
         except NotImplementedError:
-            # Windows از add_signal_handler پشتیبانی نمی‌کنه
             pass
 
     logger.info("🚀 ربات شروع به کار کرد...")
     
     try:
-        # شروع polling
         polling_task = asyncio.create_task(dp.start_polling(bot))
-        
-        # منتظر سیگنال توقف باش
         await stop_event.wait()
-        
-        # لغو polling
         polling_task.cancel()
         try:
             await polling_task
         except asyncio.CancelledError:
             pass
-        
     except Exception as e:
         logger.critical(f"❌ خطای بحرانی: {e}")
     finally:
